@@ -5,15 +5,20 @@ import numpy as np
 vec2i = ti.types.vector(2, ti.i32)
 
 width = 768
-N = 5
+N = 3
 r = 0.2 / np.sqrt(N)
 vm = 5 * r
 m = 1
+g = tm.vec2(0, -0.0)
+c_r = 1.0
 
 ti.init(arch=ti.cpu)#, cpu_max_num_threads=1)
 
+# system kinematic state
 x = ti.Vector.field(2, shape=(N,), dtype=ti.f32)
 v = ti.Vector.field(2, shape=(N,), dtype=ti.f32)
+
+# highlighting state for visualizing collisions
 coll = ti.field(shape=(N,), dtype=ti.u8)
 colors = ti.Vector.field(3, shape=(N,), dtype=ti.f32)
 
@@ -23,12 +28,15 @@ v.from_numpy(np.random.normal(0, vm, (N,2)).astype(np.float32))
 h = 1/60
 
 @ti.kernel
-def update():
+def update_vel():
 
-    # E_k = 0.0
-    # for i in v:
-    #     E_k += 0.5 * m * v[i].dot(v[i])
+    E_k = 0.0
+    for i in v:
+        E_k += 0.5 * m * v[i].dot(v[i])
     # print("energy", E_k)
+
+    for i in v:
+        v[i] += h * g
 
     for i in coll:
         coll[i] = ti.u8(tm.floor(0.9 * coll[i]))
@@ -64,41 +72,62 @@ def sphere_ccd(x0, x1, v0, v1, tMin, tMax):
     if D >= 0:
         r = -0.5 * (b + tm.sign(b) * tm.sqrt(D))
         ta, tb = r/a, c/r
-        if tMin <= ta <= t_c:
+        if tMin - 1e-6 <= ta < t_c:
             t_c = ta
-        if tMin <= tb <= t_c:
+        if tMin - 1e-6 <= tb < t_c:
             t_c = tb
     return t_c if t_c < tMax else np.nan
 
+# collision detection returning the single first collision
 @ti.kernel
-def cd_brute(h : ti.f32) -> ti.f32:
-    t_c = h
+def cd_brute_single(h : ti.f32) -> ti.f32:
+    t_c = h + 1e-5
+    collide = False
+    ifirst, jfirst = -1, -1
     ti.loop_config(serialize=True)
     for i in range(N):
         for j in range(i):
-            t_c = sphere_ccd(x[i],  x[j], v[i], v[j], 0, h)
-            if not tm.isnan(t_c):
-                m_i, m_j = m, m
-                if (v[i] - v[j]).dot(x[i] - x[j]) < 0:
-                    coll[i] = ti.u8(255)
-                    coll[j] = ti.u8(255)
-                    n = tm.normalize(x[i] - x[j])
-                    v_n = (v[i] - v[j]).dot(n)
-                    m_eff = 1/(1/m_i + 1/m_j)
-                    gamma = -2 * m_eff * v_n
-                    impulse = gamma * n
-                    v[i] = v[i] + impulse / m_i
-                    v[j] = v[j] - impulse / m_j
-            if tm.length(x[i] - x[j]) < 2*r:
-                print("yikes! particles overlap!", i, j)
+            if tm.length(x[i] - x[j]) < 2*r + h * tm.length(v[i]) + h * tm.length(v[j]):
+                t = sphere_ccd(x[i], x[j], v[i], v[j], 0, t_c)
+                if not tm.isnan(t):
+                    if (v[i] - v[j]).dot(x[i] - x[j]) < 0:
+                        t_c = t
+                        ifirst, jfirst = i, j
+            if tm.length(x[i] - x[j]) < 2*r * (1-1e-5):
+                print("yikes! particles overlap!", i, j, tm.length(x[i] - x[j]))
+
+    if t_c < h:
+        coll[ifirst] = ti.u8(255)
+        coll[jfirst] = ti.u8(255)
+        C_pairs[0] = vec2i(ifirst, jfirst)
+        C_times[0] = t_c
+    else:
+        C_times[0] = np.nan
+        t_c = np.nan
 
     return t_c
 
 
 @ti.kernel
-def advance(t : ti.f32):
+def advance_pos(t : ti.f32):
     for k in x:
         x[k] = x[k] + t * v[k]
+
+
+@ti.kernel
+def cr_sequential(t_c : ti.f32):
+
+    i,j = C_pairs[0]
+    m_i, m_j = m, m
+
+    if not tm.isnan(t_c):
+        n = tm.normalize(x[i] - x[j])
+        v_n = (v[i] - v[j]).dot(n)
+        m_eff = 1/(1/m_i + 1/m_j)
+        gamma = -(1 + c_r) * m_eff * v_n
+        impulse = gamma * n
+        v[i] = v[i] + impulse / m_i
+        v[j] = v[j] - impulse / m_j
 
 
 @ti.kernel
@@ -110,16 +139,30 @@ def set_colors():
 # Create Taichi UI
 window = ti.ui.Window("Collisions!", (width, width), vsync=True)
 canvas = window.get_canvas()
-canvas.set_background_color((0.5, 0.5, 0.5))
+canvas.set_background_color((0.3, 0.3, 0.3))
+
+def r2(x):
+    return np.round(1e4 * x) / 1e2
 
 while window.running:
 
-    update()
-    cd_brute(h)
-    advance(h)
+    update_vel()
+    t = 0
+    iter = 0
+    done = False
+    while not done and iter < 10:
+        iter += 1
+        t_c = cd_brute_single(h - t)
+        if np.isfinite(t_c):
+            advance_pos(t_c)
+            cr_sequential(t_c)
+            t = t + t_c
+        else:
+            done = True
+    advance_pos(h - t)
     set_colors()
 
     # radius needs to be doubled on high DPI displays
-    canvas.circles(x, radius=2*r, per_vertex_color=colors)
+    canvas.circles(x, radius=0.5*r, per_vertex_color=colors)
 
     window.show()
